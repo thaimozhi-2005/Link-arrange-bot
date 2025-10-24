@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Telegram Bot for formatting episode links
-Install dependencies: pip install python-telegram-bot
+Telegram Bot for formatting episode links - Webhook Version for Render
+Install dependencies: pip install python-telegram-bot flask
 Run: python3 bot.py
 """
 
 import re
 import logging
 import os
+from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
+import asyncio
+from threading import Thread
 
 # Configure logging
 logging.basicConfig(
@@ -19,19 +22,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Get bot token from environment variable (for Render deployment)
+# Get configuration from environment
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", "")  # Render provides this
+PORT = int(os.environ.get("PORT", 10000))  # Render provides this
 
 # Store user data temporarily
 user_sessions = {}
 
+# Flask app for webhook
+app = Flask(__name__)
+
 def parse_bulk_output(text):
     """Parse the bulk upload output and extract episode links by quality"""
     episodes = {}
-    
-    # Pattern to match episode lines
     pattern = r'S(\d+)-E(\d+).*?(480|720|1080).*?(https://t\.me/[^\s]+)'
-    
     matches = re.finditer(pattern, text)
     
     for match in matches:
@@ -52,31 +57,21 @@ def parse_bulk_output(text):
 def format_output(episodes):
     """Format episodes into the desired output with hyperlinks"""
     output_lines = []
-    
-    # Sort episodes by episode number
     sorted_eps = sorted(episodes.items(), key=lambda x: int(x[0][1:]))
-    
-    # Map for bold unicode numbers
     bold_nums = str.maketrans('0123456789', '𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗')
     
     for ep_num, qualities in sorted_eps:
-        # Create hyperlinked quality text
         quality_links = []
         
         for quality in ['480', '720', '1080']:
             if quality in qualities:
                 bold_quality = f"{quality}𝐏".translate(bold_nums)
-                # Create hyperlink in Telegram HTML format
                 quality_links.append(f'<a href="{qualities[quality]}">{bold_quality}</a>')
             else:
-                # If quality not available, show placeholder
                 bold_quality = f"{quality}𝐏".translate(bold_nums)
                 quality_links.append(f"<s>{bold_quality}</s>")
         
-        # Format episode number
         bold_ep = ep_num.translate(bold_nums)
-        
-        # Create line with proper spacing
         line = f"➪ {bold_ep}      {quality_links[0]}      {quality_links[1]}       {quality_links[2]}"
         output_lines.append(line)
     
@@ -116,12 +111,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start upload session"""
     user_id = update.effective_user.id
-    
-    # Initialize session for user
-    user_sessions[user_id] = {
-        'collecting': True,
-        'messages': []
-    }
+    user_sessions[user_id] = {'collecting': True, 'messages': []}
     
     await update.message.reply_text(
         "✅ <b>Upload mode activated!</b>\n\n"
@@ -139,15 +129,13 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in user_sessions:
         del user_sessions[user_id]
         await update.message.reply_text(
-            "❌ Upload session cancelled.\n"
-            "Use /upload to start a new session.",
+            "❌ Upload session cancelled.\nUse /upload to start a new session.",
             parse_mode=ParseMode.HTML
         )
         logger.info(f"User {user_id} cancelled upload session")
     else:
         await update.message.reply_text(
-            "ℹ️ No active upload session.\n"
-            "Use /upload to start collecting links.",
+            "ℹ️ No active upload session.\nUse /upload to start collecting links.",
             parse_mode=ParseMode.HTML
         )
 
@@ -184,8 +172,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(
-            "ℹ️ No active upload session.\n"
-            "Use /upload to start collecting links.",
+            "ℹ️ No active upload session.\nUse /upload to start collecting links.",
             parse_mode=ParseMode.HTML
         )
 
@@ -193,17 +180,13 @@ async def collect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Collect messages during upload session"""
     user_id = update.effective_user.id
     
-    # Check if user has active session
     if user_id not in user_sessions or not user_sessions[user_id]['collecting']:
-        return  # Ignore messages when not in upload mode
+        return
     
     user_text = update.message.text
-    
-    # Store the message
     user_sessions[user_id]['messages'].append(user_text)
-    
-    # Send confirmation
     msg_count = len(user_sessions[user_id]['messages'])
+    
     await update.message.reply_text(
         f"✅ Message collected! ({msg_count} total)\n"
         f"Continue pasting or use /format when done.",
@@ -216,11 +199,9 @@ async def format_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Format all collected messages into final output"""
     user_id = update.effective_user.id
     
-    # Check if user has active session
     if user_id not in user_sessions:
         await update.message.reply_text(
-            "❌ No upload session found.\n"
-            "Use /upload to start collecting links first.",
+            "❌ No upload session found.\nUse /upload to start collecting links first.",
             parse_mode=ParseMode.HTML
         )
         return
@@ -236,10 +217,7 @@ async def format_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        # Combine all messages
         combined_text = '\n'.join(messages)
-        
-        # Parse all episodes from combined text
         episodes = parse_bulk_output(combined_text)
         
         if not episodes:
@@ -250,13 +228,9 @@ async def format_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Format the output
         formatted_output = format_output(episodes)
-        
-        # Send formatted result
         header = "✅ <b>Formatted Episode Links:</b>\n\n"
         footer = f"\n\n📊 Total Episodes: {len(episodes)}"
-        
         full_output = header + formatted_output + footer
         
         await update.message.reply_text(
@@ -266,8 +240,6 @@ async def format_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         logger.info(f"Formatted {len(episodes)} episodes for user {user_id}")
-        
-        # Clear session after successful format
         del user_sessions[user_id]
         
         await update.message.reply_text(
@@ -283,17 +255,15 @@ async def format_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
-def main():
-    """Start the bot"""
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("\n⚠️  ERROR: Please replace 'YOUR_BOT_TOKEN_HERE' with your actual bot token!")
-        print("Get your token from @BotFather on Telegram\n")
-        return
-    
-    # Create the Application
+# Initialize bot application
+application = None
+
+async def initialize_bot():
+    """Initialize the bot application"""
+    global application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Register command handlers
+    # Register handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("upload", upload_command))
@@ -301,19 +271,45 @@ def main():
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("status", status_command))
-    
-    # Register message handler for collecting messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_messages))
     
-    # Start the bot
-    print("🤖 Bot is running... Press Ctrl+C to stop")
-    print("\nCommands available:")
-    print("  /upload - Start collecting links")
-    print("  /format - Generate formatted output")
-    print("  /cancel - Cancel current session")
-    print("  /clear  - Clear collected links")
-    print("  /status - Check session status")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    await application.initialize()
+    await application.start()
+    
+    # Set webhook
+    webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+    await application.bot.set_webhook(url=webhook_url)
+    logger.info(f"Webhook set to: {webhook_url}")
+
+@app.route('/')
+def index():
+    """Health check endpoint"""
+    return "Bot is running!", 200
+
+@app.route(f'/{BOT_TOKEN}', methods=['POST'])
+def webhook():
+    """Handle incoming updates from Telegram"""
+    try:
+        json_data = request.get_json()
+        update = Update.de_json(json_data, application.bot)
+        asyncio.run(application.process_update(update))
+        return "OK", 200
+    except Exception as e:
+        logger.error(f"Error processing update: {e}")
+        return "Error", 500
+
+def run_flask():
+    """Run Flask server"""
+    app.run(host='0.0.0.0', port=PORT)
 
 if __name__ == '__main__':
-    main()
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("\n⚠️  ERROR: Please set BOT_TOKEN environment variable!")
+        print("Get your token from @BotFather on Telegram\n")
+    else:
+        # Initialize bot
+        asyncio.run(initialize_bot())
+        
+        # Start Flask server
+        logger.info(f"🤖 Bot webhook server starting on port {PORT}...")
+        run_flask()

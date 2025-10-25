@@ -33,6 +33,10 @@ user_sessions = {}
 # Flask app for webhook
 app = Flask(__name__)
 
+# Bot application (will be initialized)
+application = None
+bot_loop = None
+
 def parse_bulk_output(text):
     """Parse the bulk upload output and extract episode links by quality"""
     episodes = {}
@@ -255,9 +259,6 @@ async def format_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
-# Initialize bot application
-application = None
-
 async def initialize_bot():
     """Initialize the bot application"""
     global application
@@ -281,6 +282,14 @@ async def initialize_bot():
     await application.bot.set_webhook(url=webhook_url)
     logger.info(f"Webhook set to: {webhook_url}")
 
+def run_bot_async():
+    """Run bot initialization in a separate thread"""
+    global bot_loop
+    bot_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(bot_loop)
+    bot_loop.run_until_complete(initialize_bot())
+    bot_loop.run_forever()
+
 @app.route('/')
 def index():
     """Health check endpoint"""
@@ -292,24 +301,31 @@ def webhook():
     try:
         json_data = request.get_json()
         update = Update.de_json(json_data, application.bot)
-        asyncio.run(application.process_update(update))
+        
+        # Process update in bot's event loop
+        asyncio.run_coroutine_threadsafe(
+            application.process_update(update),
+            bot_loop
+        )
+        
         return "OK", 200
     except Exception as e:
         logger.error(f"Error processing update: {e}")
         return "Error", 500
-
-def run_flask():
-    """Run Flask server"""
-    app.run(host='0.0.0.0', port=PORT)
 
 if __name__ == '__main__':
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("\n⚠️  ERROR: Please set BOT_TOKEN environment variable!")
         print("Get your token from @BotFather on Telegram\n")
     else:
-        # Initialize bot
-        asyncio.run(initialize_bot())
+        # Start bot initialization in background thread
+        bot_thread = Thread(target=run_bot_async, daemon=True)
+        bot_thread.start()
         
-        # Start Flask server
+        # Give the bot a moment to initialize
+        import time
+        time.sleep(2)
+        
+        # Start Flask server (this opens the port immediately)
         logger.info(f"🤖 Bot webhook server starting on port {PORT}...")
-        run_flask()
+        app.run(host='0.0.0.0', port=PORT, debug=False)
